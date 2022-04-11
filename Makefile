@@ -7,16 +7,6 @@ ifeq ($(VERSION),)
 	VERSION = ${GIT_SHA}-devel
 endif
 
-.PHONY: fetch-helpers
-fetch-helpers:
-	for i in $(shell find mappings -name '*.yml' -exec basename {} .yml \;); do \
-		scripts/helpers/fetch-helper-$$i.sh; \
-	done
-
-.PHONY: copy-mappings
-copy-mappings:
-	cp -r mappings internal/embedded/mappings/embedded
-
 .PHONY: vendor
 vendor:
 	go mod vendor
@@ -28,20 +18,6 @@ build-magic:
 			-o bin/docker-credential-magic \
 			.../cmd/docker-credential-magic
 
-.PHONY: build-magic-embedded
-build-magic-embedded:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-X main.Version=$(VERSION)" \
-			-o internal/embedded/helpers/embedded/docker-credential-magic \
-			.../cmd/docker-credential-magic
-
-.PHONY: build-magician
-build-magician:
-	CGO_ENABLED=0 \
-		go build -ldflags="-X main.Version=$(VERSION)" \
-			-o bin/docker-credential-magician \
-			.../cmd/docker-credential-magician
-
 .PHONY: test
 test:
 	scripts/test.sh
@@ -52,6 +28,4 @@ acceptance:
 
 .PHONY: clean
 clean:
-	rm -rf .venv/ .cover/ .robot/ bin/ tmp/ vendor/ \
-		internal/embedded/helpers/embedded \
-		internal/embedded/mappings/embedded
+	rm -rf .venv/ .cover/ .robot/ bin/ tmp/ vendor/

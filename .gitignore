@@ -31,3 +31,5 @@ tmp/
 .robot/
 acceptance/lib/__pycache__/
 test.env
+
+docker-credential-magic

@@ -3,37 +3,25 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
-	"strings"
 
-	"github.com/adrg/xdg"
-	"github.com/docker/cli/cli/config"
-	"github.com/docker/docker/pkg/homedir"
+	ecr "github.com/awslabs/amazon-ecr-credential-helper/ecr-login"
+	"github.com/chrismellard/docker-credential-acr-env/pkg/credhelper"
 	"github.com/google/go-containerregistry/pkg/authn"
-	"gopkg.in/yaml.v2"
+	"github.com/google/go-containerregistry/pkg/authn/github"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/google"
 
 	"github.com/docker-credential-magic/docker-credential-magic/internal/constants"
-	"github.com/docker-credential-magic/docker-credential-magic/internal/embedded/mappings"
-	"github.com/docker-credential-magic/docker-credential-magic/internal/types"
 )
 
 var (
 	// Version can be set via:
 	// -ldflags="-X main.Version=$TAG"
 	Version string
-
-	errorInvalidDomain = errors.New("supplied domain is invalid")
-
-	// TODO: should use existing cred helper/docker config if no match
-	errorHelperNotFound = errors.New("could not determine correct helper")
-
-	validHelper = regexp.MustCompile(`^[a-z0-9_-].*?$`)
 )
 
 func main() {
@@ -45,14 +33,12 @@ func main() {
 	switch subcommand {
 	case constants.HelperSubcommandGet:
 		subcommandGet()
-	case "home":
-		subcommandHome()
-	case "init":
-		subcommandInit()
 	case "version":
 		subcommandVersion()
+	default:
+		usage()
+		log.Fatalf("not implemented:", subcommand)
 	}
-	usage()
 }
 
 func usage() {
@@ -61,227 +47,38 @@ func usage() {
 	os.Exit(1)
 }
 
+// keychain provides cred helper logic for common registry implementations.
+var keychain = authn.NewMultiKeychain(
+	google.Keychain,
+	github.Keychain,
+	authn.NewKeychainFromHelper(ecr.NewECRHelper(ecr.WithLogger(ioutil.Discard))),
+	authn.NewKeychainFromHelper(credhelper.NewACRCredentialsHelper()),
+)
+
 func subcommandGet() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Scan()
 	rawInput := scanner.Text()
-	domain, err := parseDomain(rawInput)
+	reg, err := name.NewRegistry(rawInput)
 	if err != nil {
-		// TODO: invalid domain includes "localhost:5000" etc.
-		// not supported for now
-		getFallback(rawInput)
+		log.Fatalf("parsing registry server URL: %v", err)
 	}
-	helperExe, err := getHelperExecutable(domain)
-	if err != nil {
-		if err != errorHelperNotFound {
-			fmt.Printf("[magic] getting helper executable for domain: %s\n", err.Error())
-			os.Exit(1)
-		}
-		getFallback(rawInput)
-	}
-	cmd := exec.Command(helperExe, constants.HelperSubcommandGet)
-	cmd.Stdin = strings.NewReader(rawInput)
-	cmd.Stderr = os.Stderr
-	cmd.Stdout = os.Stdout
-	err = cmd.Run()
-	if err != nil {
-		fmt.Printf("[magic] exec \"%s\": %s\n", helperExe, err.Error())
-		os.Exit(1)
-	}
-	os.Exit(0)
-}
 
-func subcommandHome() {
-	dockerCredentialMagicConfig := getDockerCredentialMagicConfig()
-	fmt.Println(dockerCredentialMagicConfig)
-	os.Exit(0)
-}
-
-func subcommandInit() {
-	dockerCredentialMagicConfig := getDockerCredentialMagicConfig()
-	dockerCredentialMagicConfigDirAbs, err := filepath.Abs(dockerCredentialMagicConfig)
-	if err != nil {
-		fmt.Printf("Error: '%s' is not a valid directory\n", dockerCredentialMagicConfig)
-		os.Exit(1)
-	}
-	parentDir := filepath.Join(dockerCredentialMagicConfigDirAbs, constants.MappingsSubdir)
-	if info, err := os.Stat(parentDir); err == nil && info.IsDir() {
-		fmt.Printf("Directory '%s' already exists. Skipping.\n", parentDir)
-	} else {
-		fmt.Printf("Creating directory '%s' ...\n", parentDir)
-		if err := os.MkdirAll(parentDir, 0755); err != nil {
-			fmt.Printf("Error creating directory: %s\n", err.Error())
-			os.Exit(1)
-		}
-	}
-	items, err := mappings.Embedded.ReadDir(constants.EmbeddedParentDir)
-	if err != nil {
-		fmt.Printf("Error reading embedded directory: %s\n", err.Error())
-		os.Exit(1)
-	}
-	for _, item := range items {
-		filename := filepath.Join(parentDir, item.Name())
-		if _, err := os.Stat(filename); err == nil {
-			fmt.Printf("File '%s' already exists. Skipping.\n", filename)
-			continue
-		}
-		fmt.Printf("Creating mapping file '%s' ...\n", filename)
-		embeddedName := filepath.Join(constants.EmbeddedParentDir, item.Name())
-		file, err := mappings.Embedded.Open(embeddedName)
+	if auth, _ := keychain.Resolve(reg); auth != authn.Anonymous {
+		ac, err := auth.Authorization()
 		if err != nil {
-			fmt.Printf("Error loading embedded file %s: %s\n", embeddedName, err.Error())
-			os.Exit(1)
+			log.Fatalf("getting creds: %v", err)
 		}
-		defer file.Close()
-		b, err := ioutil.ReadAll(file)
-		if err != nil {
-			fmt.Printf("Error reading embedded file %s: %s\n", embeddedName, err.Error())
-			os.Exit(1)
-		}
-		if err = ioutil.WriteFile(filename, b, 0644); err != nil {
-			fmt.Printf("Error writing embedded file %s: %s\n", embeddedName, err.Error())
-			os.Exit(1)
+		if err := json.NewEncoder(os.Stdout).Encode(toCreds(ac)); err != nil {
+			log.Fatal("[magic] json.Encode: %v", err)
 		}
 	}
-	magicConfig := filepath.Join(dockerCredentialMagicConfigDirAbs, constants.DockerConfigFileBasename)
-	if _, err := os.Stat(magicConfig); err == nil {
-		fmt.Printf("File '%s' already exists. Skipping.\n", magicConfig)
-	} else {
-		fmt.Printf("Creating magic config file '%s' ...\n", magicConfig)
-		err := ioutil.WriteFile(magicConfig, []byte(constants.DockerConfigFileContents), 0644)
-		if err != nil {
-			fmt.Printf("Error writing magic config file %s: %s\n", magicConfig, err.Error())
-			os.Exit(1)
-		}
-	}
-	os.Exit(0)
+	log.Fatalf("no matching credentials for %q", rawInput)
 }
 
 func subcommandVersion() {
 	fmt.Println(Version)
 	os.Exit(0)
-}
-
-func getFallback(rawInput string) {
-	var fallback string
-
-	// If DOCKER_ORIG_CONFIG set, fallback to that
-	if orig := os.Getenv(constants.EnvVarDockerOrigConfig); orig != "" {
-		fallback = orig
-	} else {
-		// If ~/.docker/config.json exists, fallback to that
-		dockerHomeDir := filepath.Join(homedir.Get(), constants.DockerHomeDir)
-		dockerConfigFile := filepath.Join(dockerHomeDir, constants.DockerConfigFileBasename)
-		if _, err := os.Stat(dockerConfigFile); err == nil {
-			fallback = dockerHomeDir
-		}
-	}
-
-	if fallback == "" {
-		// If no match and no fallback, send the anonymous token response
-		fmt.Print(constants.AnonymousTokenResponse)
-		os.Exit(0)
-	}
-
-	cf, err := config.Load(fallback)
-	if err != nil {
-		fmt.Printf("[magic] loading fallback config \"%s\": %s\n", fallback, err.Error())
-		os.Exit(1)
-	}
-
-	// In the following 2 scenarios we could end up with an endless loop, so short circuit
-	if cf.CredentialsStore == constants.MagicCredentialSuffix {
-		fmt.Print(constants.AnonymousTokenResponse)
-		os.Exit(0)
-	}
-	if v, ok := cf.CredentialHelpers[rawInput]; ok && v == constants.MagicCredentialSuffix {
-		fmt.Print(constants.AnonymousTokenResponse)
-		os.Exit(0)
-	}
-
-	cfg, err := cf.GetAuthConfig(rawInput)
-	if err != nil {
-		fmt.Printf("[magic] get auth config for domain: %s\n", err.Error())
-		fmt.Println(err.Error())
-		os.Exit(1)
-	}
-	creds := toCreds(&authn.AuthConfig{
-		Username:      cfg.Username,
-		Password:      cfg.Password,
-		Auth:          cfg.Auth,
-		IdentityToken: cfg.IdentityToken,
-		RegistryToken: cfg.RegistryToken,
-	})
-	b, err := json.Marshal(&creds)
-	if err != nil {
-		fmt.Printf("[magic] converting creds to json: %s\n", err.Error())
-		fmt.Println(err.Error())
-		os.Exit(1)
-	}
-	fmt.Println(string(b))
-	os.Exit(0)
-}
-
-func parseDomain(s string) (string, error) {
-	parts := strings.Split(s, ".")
-	numParts := len(parts)
-	if numParts < 2 {
-		return "", errorInvalidDomain
-	}
-	root := parts[numParts-2]
-	ext := parts[numParts-1]
-	if root == "" || ext == "" {
-		return "", errorInvalidDomain
-	}
-	domain := strings.Join([]string{root, ext}, ".")
-	return domain, nil
-}
-
-func getHelperExecutable(domain string) (string, error) {
-	dockerCredentialMagicConfig := getDockerCredentialMagicConfig()
-	parentDir := filepath.Join(dockerCredentialMagicConfig, constants.MappingsSubdir)
-	parentDirAbs, err := filepath.Abs(parentDir)
-	if err != nil {
-		return "", fmt.Errorf("'%s' is not a valid directory", dockerCredentialMagicConfig)
-	}
-	notExistsErr := fmt.Errorf(
-		"Directory '%s' does not exist.\nHint: Try running \"docker-credential-magic init\"",
-		parentDirAbs)
-	if info, err := os.Stat(parentDirAbs); err != nil || !info.IsDir() {
-		return "", notExistsErr
-	}
-	items, err := ioutil.ReadDir(parentDirAbs)
-	if err != nil {
-		return "", notExistsErr
-	}
-	for _, item := range items {
-		filename := filepath.Join(parentDirAbs, item.Name())
-		b, err := ioutil.ReadFile(filename)
-		if err != nil {
-			return "", fmt.Errorf("unable to open '%s': %v", filename, err)
-		}
-		var m types.HelperMapping
-		err = yaml.Unmarshal(b, &m)
-		if err != nil {
-			return "", fmt.Errorf("parsing mappings for '%s': %v", filename, err)
-		}
-		if !validHelper.MatchString(m.Helper) {
-			return "", fmt.Errorf("helper '%s' is invalid", m.Helper)
-		}
-		for _, d := range m.Domains {
-			if d == domain {
-				return fmt.Sprintf("%s-%s", constants.DockerCredentialPrefix, m.Helper), nil
-			}
-		}
-	}
-	return "", errorHelperNotFound
-}
-
-func getDockerCredentialMagicConfig() string {
-	if d := os.Getenv(constants.EnvVarDockerCredentialMagicConfig); d != "" {
-		return d
-	}
-	return filepath.Join(xdg.ConfigHome, constants.XDGConfigSubdir)
 }
 
 // Borrowed from:
